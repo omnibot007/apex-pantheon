@@ -34,9 +34,11 @@
             "cacheRead": 0.003,
             "cacheWrite": 0
           },
-          "why": "V4.1 Flash, 4x promo window"
+          "why": "V4.1 Flash, 4x promo window. REASONING MODEL: measured 600 reasoning_tokens on one call. Budget maxTokens for reasoning or content comes back EMPTY -- an 80-token cap produced a blank answer that looked like a failure.",
+          "reasoning": true
         }
-      ]
+      ],
+      "_identity": "DOCUMENTED, NOT INDEPENDENTLY VERIFIED. The vendor endpoint table at opencode.ai/docs/go maps \"DeepSeek V4.1 Flash\" to the id deepseek-flash, and lists deepseek-v4-flash separately as a different product with a different monthly limit. Four attempts to confirm it empirically all failed to discriminate: /models returns no version metadata, the response echoes the requested id, temperature-0 divergence was invalidated by a self-consistency control (NEITHER id is self-consistent at temp 0), and no quota headers are returned. The vendor doc is the receipt; treat it as documented."
     },
     {
       "id": "go-muse",
@@ -59,9 +61,10 @@
             "cacheWrite": 0
           },
           "enabled": false,
-          "why": "returned EMPTY with 0 tokens in and out on first contact -- responses-API wiring not proven yet, benched until it is"
+          "why": "HTTP 403 DataPolicyError -- NOT a wiring bug. The gateway refuses this model until the workspace explicitly opts in to its data collection: https://opencode.ai/workspace/<your-wrk-id>/go . Opting in permits prompts AND completions to train future Meta models. Operator decision, not a config one."
         }
-      ]
+      ],
+      "_blocked": "403 DataPolicyError at the gateway. The /responses wiring is in place and untested because the account cannot reach the model. Free variant muse-spark-1.3-contributor-free returns HTTP 500 on zen/v1."
     },
     {
       "id": "openrouter-free",
