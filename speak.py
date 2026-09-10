@@ -12,6 +12,7 @@ import tempfile
 import winsound
 
 VOICE = os.environ.get("FAM_VOICE", "bm_lewis")
+SERVER = os.environ.get("FAM_VOICE_SERVER", "http://127.0.0.1:17840")
 
 
 def clean(text):
@@ -45,9 +46,27 @@ def main():
         return 2
     no_play = "--no-play" in sys.argv
     voice = VOICE
+    server_off = "--no-server" in sys.argv
     for a in sys.argv[1:]:
         if a.startswith("--voice="):
             voice = a.split("=", 1)[1]
+    # Fast path: warm server (voice-server.py). Falls through to cold load
+    # when the server is down — never fails a narration for speed's sake.
+    if not no_play and not server_off:
+        try:
+            import json as _json
+            import urllib.request as _url
+
+            req = _url.Request(
+                SERVER + "/speak",
+                data=_json.dumps({"text": text, "voice": voice, "play": True}).encode(),
+                headers={"Content-Type": "application/json"},
+            )
+            res = _json.load(_url.urlopen(req, timeout=600))
+            if res.get("ok"):
+                return 0
+        except Exception as e:
+            print(f"speak: server miss ({type(e).__name__}), cold path", file=sys.stderr)
     from kokoro import KPipeline
     import soundfile as sf
 
