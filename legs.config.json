@@ -1,6 +1,6 @@
 {
   "_note": "Generated from measured hell.ts results. legs.ts reads this and falls back to BUILTIN_SPECS if missing or malformed, so deleting it cannot break the pool.",
-  "_ordering": "TIER then LATENCY. tier1 = perfect judgement + no infra trouble. tier2 = perfect judgement but flaky. tier3 = ANSWERS BUT GETS THE JUDGEMENT WRONG -- kept last as fallback capacity, never trust one with a ranking. Price ranks nothing here: every model is cost:0. Legs whose id ends -t3 hold models that ANSWER BUT GET THE JUDGEMENT WRONG; they are placed after every correct-judgement model because the failover loop drains a leg before moving on.",
+  "_ordering": "METERED-FIRST for speed, then the free pool by tier. DeepSeek V4.1 Flash answers in ~2s where the free pool best is 27s. TIER then LATENCY. tier1 = perfect judgement + no infra trouble. tier2 = perfect judgement but flaky. tier3 = ANSWERS BUT GETS THE JUDGEMENT WRONG -- kept last as fallback capacity, never trust one with a ranking. Price ranks nothing here: every model is cost:0. Legs whose id ends -t3 hold models that ANSWER BUT GET THE JUDGEMENT WRONG; they are placed after every correct-judgement model because the failover loop drains a leg before moving on.",
   "_tier3warning": "Six models answer fast and confidently and called a DAG renderer IRRELEVANT to a dependency planner. Speed-first ordering would have promoted exactly those.",
   "version": 1,
   "generatedAt": "2026-09-10T15:35:00.203Z",
@@ -14,6 +14,55 @@
     "no-refuse"
   ],
   "legs": [
+    {
+      "id": "go-fast",
+      "name": "GoFast",
+      "baseUrl": "https://opencode.ai/zen/go/v1",
+      "keyEnv": "OPENCODE_GO_KEY",
+      "api": "openai-completions",
+      "maxTokens": 4096,
+      "_why": "DeepSeek V4.1 Flash. Model id is deepseek-flash -- NOT deepseek-v4.1-flash, and NOT the older deepseek-v4-flash which is a different model. 4x usage promo: 6,500 -> 26,000 requests per 5 hours, limited time. Off-peak 01-04 and 06-10 UTC Mon-Fri are DOUBLE price.",
+      "_triage": "Measured 4/6 on a binary RELEVANT/IRRELEVANT verdict, biased toward rejection -- it threw away BOTH donors that were actually taken. Same model on a 1-10 SCORE separated cleanly: real donors 6,6 vs noise 2,2,1. ASK FOR A SCORE, NEVER A VERDICT.",
+      "models": [
+        {
+          "id": "deepseek-flash",
+          "tier": 1,
+          "ms": 2000,
+          "cost": {
+            "input": 0.15,
+            "output": 0.6,
+            "cacheRead": 0.003,
+            "cacheWrite": 0
+          },
+          "why": "V4.1 Flash, 4x promo window"
+        }
+      ]
+    },
+    {
+      "id": "go-muse",
+      "name": "GoMuse",
+      "baseUrl": "https://opencode.ai/zen/go/v1",
+      "keyEnv": "OPENCODE_GO_KEY",
+      "api": "openai-responses",
+      "maxTokens": 4096,
+      "_why": "Muse Spark 1.3 Contributor -- 45,300 req/5hr, the highest limit on the Go plan. Uses the /responses API, not /chat/completions.",
+      "_privacy": "CONTRIBUTOR TIER: discounted in exchange for permission to train future Meta models on prompts AND completions. Not ZDR. Region-limited. Do not send anything you would not publish.",
+      "models": [
+        {
+          "id": "muse-spark-1.3-contributor",
+          "tier": 4,
+          "ms": 200,
+          "cost": {
+            "input": 0.1,
+            "output": 0.2,
+            "cacheRead": 0.002,
+            "cacheWrite": 0
+          },
+          "enabled": false,
+          "why": "returned EMPTY with 0 tokens in and out on first contact -- responses-API wiring not proven yet, benched until it is"
+        }
+      ]
+    },
     {
       "id": "openrouter-free",
       "name": "OpenRouterFree",

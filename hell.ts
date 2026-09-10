@@ -166,6 +166,7 @@ const CANDIDATES: Record<string, { baseUrl: string; keyEnv: string | null; model
       "dots-studio/dots-3-note-preview:free",
     ],
   },
+  zen: { baseUrl: "https://opencode.ai/zen/v1", keyEnv: "OPENCODE_GO_KEY", models: ["deepseek-v4-pro","deepseek-v4-flash-free","deepseek-v4-flash","qwen3.8-flash","gpt-5.6-luna"] },
   groq: { baseUrl: "https://api.groq.com/openai/v1", keyEnv: "GROQ_API_KEY", models: ["llama-3.3-70b-versatile"] },
   cerebras: { baseUrl: "https://api.cerebras.ai/v1", keyEnv: "CEREBRAS_API_KEY", models: ["llama-3.3-70b"] },
   pollinations: { baseUrl: "https://gen.pollinations.ai/v1", keyEnv: "POLLINATIONS_API_KEY", models: ["openai-large"] },

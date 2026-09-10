@@ -16,6 +16,7 @@ import {
   type Model,
 } from "@earendil-works/pi-ai";
 import { openAICompletionsApi } from "@earendil-works/pi-ai/api/openai-completions.lazy";
+import { openAIResponsesApi } from "@earendil-works/pi-ai/api/openai-responses.lazy";
 
 const GO_BASE = "https://opencode.ai/zen/go/v1"; // impl appends /chat/completions
 
@@ -33,13 +34,33 @@ function fileKeyEnv(varName: string, filePath: string): void {
   }
 }
 
+export interface ModelCost {
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+}
+const FREE: ModelCost = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+
+/**
+ * Two API shapes live behind one key.
+ *
+ * OpenCode Go serves `deepseek-flash` and the GLM/Kimi family on
+ * `/chat/completions`, but `muse-spark-*-contributor` on `/responses` -- a different
+ * wire format, not a different base URL. Hardcoding openAICompletionsApi() made the
+ * highest-volume model on the plan (Muse Spark 1.3 Contributor, 45,300 requests per
+ * 5 hours) unreachable no matter what id was configured.
+ */
+type ApiKind = "openai-completions" | "openai-responses";
+
 function leg(
   id: string,
   name: string,
   baseUrl: string,
   keyEnv: string | null,
-  modelIds: string[],
+  models: { id: string; cost?: ModelCost }[],
   maxTokens = 4096, // free tiers cap output/min — groq on_demand allows 1000 OTPM
+  apiKind: ApiKind = "openai-completions",
 ): { id: string; provider: ReturnType<typeof createProvider>; models: string[] } {
   const provider = createProvider({
     id,
@@ -48,23 +69,25 @@ function leg(
     auth: keyEnv
       ? { apiKey: envApiKeyAuth(`${name} key`, [keyEnv]) }
       : { apiKey: { name, resolve: async () => ({ auth: {} }) } },
-    models: modelIds.map(
-      (mid): Model<"openai-completions"> => ({
-        id: mid,
-        name: `${name} ${mid}`,
-        api: "openai-completions",
+    models: models.map(
+      (m): Model<ApiKind> => ({
+        id: m.id,
+        name: `${name} ${m.id}`,
+        api: apiKind,
         provider: id,
         baseUrl,
         reasoning: false,
         input: ["text"],
-        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        // Dollars per 1M tokens (pi-ai: rates.input / 1_000_000 * usage.input).
+        // Real rates for metered models, so telemetry stops reporting $0 for a paid call.
+        cost: m.cost ?? FREE,
         contextWindow: 64000,
         maxTokens,
       }),
     ),
-    api: openAICompletionsApi(),
+    api: apiKind === "openai-responses" ? openAIResponsesApi() : openAICompletionsApi(),
   });
-  return { id, provider, models: modelIds };
+  return { id, provider, baseUrl, models: models.map((m) => m.id) };
 }
 
 export interface PoolLeg extends ReturnType<typeof leg> {
@@ -77,7 +100,8 @@ export interface LegConfigEntry {
   baseUrl: string;
   keyEnv: string | null;
   maxTokens?: number;
-  models: { id: string; enabled?: boolean; pct?: number; ms?: number; why?: string }[];
+  api?: "openai-completions" | "openai-responses";
+  models: { id: string; enabled?: boolean; tier?: number; pct?: number; ms?: number; why?: string; cost?: ModelCost }[];
 }
 
 /**
@@ -132,14 +156,14 @@ export function buildPool(sessionId: string) {
   const configured = loadConfig();
   if (configured !== null) {
     for (const entry of configured) {
-      const live = entry.models.filter((m) => m.enabled !== false).map((m) => m.id);
+      const live = entry.models.filter((m) => m.enabled !== false).map((m) => ({ id: m.id, ...(m.cost ? { cost: m.cost } : {}) }));
       if (live.length === 0) continue; // every model benched: skip the leg entirely
-      add(leg(entry.id, entry.name, entry.baseUrl, entry.keyEnv, live, entry.maxTokens ?? 4096));
+      add(leg(entry.id, entry.name, entry.baseUrl, entry.keyEnv, live, entry.maxTokens ?? 4096, entry.api ?? "openai-completions"));
     }
     if (legs.length > 0) return { models, legs };
   }
 
-  for (const s of BUILTIN_SPECS) add(leg(s.id, s.name, s.baseUrl, s.keyEnv, s.models.map((m) => m.id), s.maxTokens));
+  for (const s of BUILTIN_SPECS) add(leg(s.id, s.name, s.baseUrl, s.keyEnv, s.models.map((m) => ({ id: m.id, ...(m.cost ? { cost: m.cost } : {}) })), s.maxTokens, s.api ?? "openai-completions"));
   return { models, legs };
 }
 
@@ -189,6 +213,11 @@ export interface LegResult {
   model: string;
   text: string;
   cost: number;
+}
+
+/** Any leg pointed at opencode.ai must send the session contract, whatever it is called. */
+function isOpenCodeHost(l: { baseUrl?: string; id: string }): boolean {
+  return typeof l.baseUrl === "string" && l.baseUrl.includes("opencode.ai");
 }
 
 const TELE_MAX_BYTES = 5 * 1024 * 1024;
@@ -252,7 +281,13 @@ export async function completeWithFailover(
         const res = await withTimeout(
           pool.models.completeSimple(model, context, {
             transformHeaders: async (h) => {
-              if (l.id === "go" || l.id === "zenfree")
+              // Keyed on the ENDPOINT, not the leg id. It used to read
+              // `l.id === "go" || l.id === "zenfree"`, so adding a leg called `go-fast`
+              // against the same opencode.ai host silently sent NO session header and NO
+              // User-Agent -- which the Go docs require, and without which the edge 403s
+              // and the gateway 400s. It failed over to a 36s free model and looked like
+              // a quota problem. Any opencode.ai leg needs the contract; the id is a name.
+              if (isOpenCodeHost(l))
                 return { ...h, "x-opencode-session": l.session, "User-Agent": "fam-gods/1.0" };
               if (l.id === "kilo-anon")
                 // pi-ai's openai-completions impl throws "No API key" for keyless
@@ -273,7 +308,10 @@ export async function completeWithFailover(
           .map((b) => b.text)
           .join("");
         const cost = res.usage?.cost?.total ?? 0;
-        tele({ leg: l.id, model: mid, ok: true, cost, tried });
+        // Log what was SKIPPED to get here, not just the winner. A silent fall-through is
+        // how a misconfigured primary hides: the header bug above sent every request to a
+        // 36s free model and telemetry recorded only a cheerful success on that model.
+        tele({ leg: l.id, model: mid, ok: true, cost, tried, skipped: failures });
         breaker.set(l.id, 0);
         return { leg: l.id, model: mid, text, cost };
       } catch (e) {
