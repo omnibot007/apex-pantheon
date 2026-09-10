@@ -108,6 +108,9 @@ export async function clineLeg(task: string, model?: string): Promise<CliResult>
   return { leg: "cline", model: model ?? "cline-free/muse-spark-1.3-contributor", text, wallMs: ms };
 }
 
+/** DEPRECATED 2026-09-09: kilo-anon direct HTTPS leg (legs.ts) supersedes this
+ *  subprocess path — same free models, none of the process fragility. Kept for
+ *  fallback; prefer the pool. */
 export async function kiloLeg(task: string): Promise<CliResult> {
   const { out, ms } = await run(bin("kilo"), ["run", "--auto", task], 200000);
   const lines = strip(out);
