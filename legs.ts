@@ -16,8 +16,13 @@ import {
   type Model,
 } from "@earendil-works/pi-ai";
 import { openAICompletionsApi } from "@earendil-works/pi-ai/api/openai-completions.lazy";
+import { openAIResponsesApi } from "@earendil-works/pi-ai/api/openai-responses.lazy";
 
 const GO_BASE = "https://opencode.ai/zen/go/v1"; // impl appends /chat/completions
+
+/** Every env name the loader will populate from a key file. A leg naming anything
+ * outside this set can never authenticate. */
+const LOADED_ENV = new Set(["OPENCODE_GO_KEY", "GROQ_API_KEY", "CEREBRAS_API_KEY", "TOKENROUTER_API_KEY", "OPENROUTER_API_KEY", "POLLINATIONS_API_KEY"]);
 
 function fileKeyEnv(varName: string, filePath: string): void {
   if (!process.env[varName]) {
@@ -29,13 +34,33 @@ function fileKeyEnv(varName: string, filePath: string): void {
   }
 }
 
+export interface ModelCost {
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+}
+const FREE: ModelCost = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+
+/**
+ * Two API shapes live behind one key.
+ *
+ * OpenCode Go serves `deepseek-flash` and the GLM/Kimi family on
+ * `/chat/completions`, but `muse-spark-*-contributor` on `/responses` -- a different
+ * wire format, not a different base URL. Hardcoding openAICompletionsApi() made the
+ * highest-volume model on the plan (Muse Spark 1.3 Contributor, 45,300 requests per
+ * 5 hours) unreachable no matter what id was configured.
+ */
+type ApiKind = "openai-completions" | "openai-responses";
+
 function leg(
   id: string,
   name: string,
   baseUrl: string,
   keyEnv: string | null,
-  modelIds: string[],
+  models: { id: string; cost?: ModelCost }[],
   maxTokens = 4096, // free tiers cap output/min — groq on_demand allows 1000 OTPM
+  apiKind: ApiKind = "openai-completions",
 ): { id: string; provider: ReturnType<typeof createProvider>; models: string[] } {
   const provider = createProvider({
     id,
@@ -44,27 +69,61 @@ function leg(
     auth: keyEnv
       ? { apiKey: envApiKeyAuth(`${name} key`, [keyEnv]) }
       : { apiKey: { name, resolve: async () => ({ auth: {} }) } },
-    models: modelIds.map(
-      (mid): Model<"openai-completions"> => ({
-        id: mid,
-        name: `${name} ${mid}`,
-        api: "openai-completions",
+    models: models.map(
+      (m): Model<ApiKind> => ({
+        id: m.id,
+        name: `${name} ${m.id}`,
+        api: apiKind,
         provider: id,
         baseUrl,
         reasoning: false,
         input: ["text"],
-        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        // Dollars per 1M tokens (pi-ai: rates.input / 1_000_000 * usage.input).
+        // Real rates for metered models, so telemetry stops reporting $0 for a paid call.
+        cost: m.cost ?? FREE,
         contextWindow: 64000,
         maxTokens,
       }),
     ),
-    api: openAICompletionsApi(),
+    api: apiKind === "openai-responses" ? openAIResponsesApi() : openAICompletionsApi(),
   });
-  return { id, provider, models: modelIds };
+  return { id, provider, baseUrl, models: models.map((m) => m.id) };
 }
 
 export interface PoolLeg extends ReturnType<typeof leg> {
   session: string;
+}
+
+export interface LegConfigEntry {
+  id: string;
+  name: string;
+  baseUrl: string;
+  keyEnv: string | null;
+  maxTokens?: number;
+  api?: "openai-completions" | "openai-responses";
+  models: { id: string; enabled?: boolean; tier?: number; pct?: number; ms?: number; why?: string; cost?: ModelCost }[];
+}
+
+/**
+ * The roster as DATA, when it exists.
+ *
+ * `buildPool` used to hardcode the pool, which meant tuning it required editing failover
+ * logic -- so nobody tuned it, and it drifted: two models with proven telemetry successes
+ * were absent, five configured models had never once completed, and the strongest model
+ * in the pool sat third inside the second leg where first-clean-wins could never reach it.
+ *
+ * A missing or malformed config falls back to the built-in defaults, so deleting this
+ * file can never take the pool down.
+ */
+function loadConfig(): LegConfigEntry[] | null {
+  const path = process.env.FAM_LEGS_CONFIG ?? new URL("./legs.config.json", import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1");
+  try {
+    const raw = JSON.parse(readFileSync(path, "utf-8")) as { legs?: LegConfigEntry[] };
+    if (!Array.isArray(raw.legs) || raw.legs.length === 0) return null;
+    return raw.legs;
+  } catch {
+    return null;
+  }
 }
 
 export function buildPool(sessionId: string) {
@@ -72,7 +131,10 @@ export function buildPool(sessionId: string) {
     process.env[name.toUpperCase()] ??
     join(homedir(), ".config", "opencode", `.${name}-key`);
   fileKeyEnv("OPENCODE_GO_KEY", process.env.FAM_GO_KEY_FILE ?? kf("go"));
-  for (const k of ["GROQ_API_KEY", "CEREBRAS_API_KEY", "TOKENROUTER_API_KEY", "OPENROUTER_API_KEY"]) {
+  // POLLINATIONS_API_KEY was demanded by a leg and loaded by nothing, so that leg could
+  // never authenticate no matter what key existed -- it read as a quota failure for weeks.
+  // Any env name a leg names must appear here or the leg is dead by construction.
+  for (const k of LOADED_ENV) {
     fileKeyEnv(k, process.env[`FAM_${k.replace("_API_KEY", "")}_KEY_FILE`] ?? kf(k.toLowerCase().replace("_api_key", "")));
   }
   const models = createModels();
@@ -81,40 +143,81 @@ export function buildPool(sessionId: string) {
     models.setProvider(l.provider);
     legs.push({ ...l, session: sessionId });
   };
-  // Order = cheap-first. Failures fall through with receipts (rotation below).
-  // Kilo anonymous: unauthenticated :free only, 200 req/hr/IP. Base WITHOUT
-  // /chat/completions (impl appends it). Keyless => keyEnv null.
-  add(leg("kilo-anon", "KiloAnon", "https://api.kilo.ai/api/gateway", null, [
-    "nvidia/nemotron-3.5-lightning:free",
-  ]));
-  add(leg("openrouter-free", "OpenRouterFree", "https://openrouter.ai/api/v1", "OPENROUTER_API_KEY", [
-    "nvidia/nemotron-3.5-lightning:free",
-    "cohere/north-mini-code:free",
-    "nvidia/nemotron-3-ultra-550b-a55b:free",
-  ]));
-  // Pollinations now requires a (free) key: https://enter.pollinations.ai/keys
-  add(leg("pollinations", "Pollinations", "https://gen.pollinations.ai/v1", "POLLINATIONS_API_KEY", ["openai/gpt-5.4-nano"]));
-  // OVH anonymous trickle (2 RPM/IP, EU). Chat 429'd on first contact 2026-09-09;
-  // rotation absorbs it until quota returns. Output capped per anon limits.
-  add(leg("ovh", "OVHAnon", "https://oai.endpoints.kepler.ai.cloud.ovh.net/v1", null, ["gpt-oss-120b"], 1024));
-  add(leg("groq", "Groq", "https://api.groq.com/openai/v1", "GROQ_API_KEY", ["qwen/qwen3.8-27b"], 800));
-  add(leg("cerebras", "Cerebras", "https://api.cerebras.ai/v1", "CEREBRAS_API_KEY", ["qwen-3.8-27b"], 800));
-  add(leg("go", "GoFallback", GO_BASE, "OPENCODE_GO_KEY", ["deepseek-v4-flash", "glm-5.3-flash"]));
-  // Zen free lane rides the SAME Go key (verified: 7 free variants live here).
-  add(leg("zenfree", "ZenFree", "https://opencode.ai/zen/v1", "OPENCODE_GO_KEY", [
-    "nemotron-3.5-lightning-free",
-    "mimo-v2.5-free",
-    "ling-3.0-flash-fin-free",
-    "nemotron-3-ultra-free",
-  ]));
+
+  // Config wins when present. Order in the file IS the failover order.
+  // Every keyEnv a leg demands must be loadable, or that leg is dead by construction and
+  // reads as a quota failure. Cheap assertion, caught a real one.
+  const demanded = new Set(BUILTIN_SPECS.map((s) => s.keyEnv).filter((k): k is string => k !== null));
+  const unloadable = [...demanded].filter((k) => !LOADED_ENV.has(k));
+  if (unloadable.length > 0) {
+    process.emitWarning(`legs: keyEnv demanded but never loaded from file: ${unloadable.join(", ")}`);
+  }
+
+  const configured = loadConfig();
+  if (configured !== null) {
+    for (const entry of configured) {
+      const live = entry.models.filter((m) => m.enabled !== false).map((m) => ({ id: m.id, ...(m.cost ? { cost: m.cost } : {}) }));
+      if (live.length === 0) continue; // every model benched: skip the leg entirely
+      add(leg(entry.id, entry.name, entry.baseUrl, entry.keyEnv, live, entry.maxTokens ?? 4096, entry.api ?? "openai-completions"));
+    }
+    if (legs.length > 0) return { models, legs };
+  }
+
+  for (const s of BUILTIN_SPECS) add(leg(s.id, s.name, s.baseUrl, s.keyEnv, s.models.map((m) => ({ id: m.id, ...(m.cost ? { cost: m.cost } : {}) })), s.maxTokens, s.api ?? "openai-completions"));
   return { models, legs };
 }
+
+/**
+ * The built-in roster — the fallback when no config file is present, and the single
+ * source of connection details that `hell.ts --write-config` uses to emit one.
+ *
+ * Kilo anonymous: unauthenticated `:free` only, 200 req/hr/IP. Base URL WITHOUT
+ * /chat/completions (the impl appends it), keyless so keyEnv is null.
+ * Pollinations now requires a free key: https://enter.pollinations.ai/keys
+ * OVH anonymous trickle: 2 RPM/IP, EU, output capped per anon limits.
+ * Zen free lane rides the SAME Go key (verified: 7 free variants live there).
+ */
+export const BUILTIN_SPECS: LegConfigEntry[] = [
+  { id: "kilo-anon", name: "KiloAnon", baseUrl: "https://api.kilo.ai/api/gateway", keyEnv: null, maxTokens: 4096,
+    models: [{ id: "nvidia/nemotron-3.5-lightning:free" }] },
+  { id: "openrouter-free", name: "OpenRouterFree", baseUrl: "https://openrouter.ai/api/v1", keyEnv: "OPENROUTER_API_KEY", maxTokens: 4096,
+    models: [
+      { id: "nvidia/nemotron-3.5-lightning:free" },
+      { id: "cohere/north-mini-code:free" },
+      { id: "nvidia/nemotron-3-ultra-550b-a55b:free" },
+      { id: "nex-agi/nex-n2.5-pro:free" },
+      { id: "dots-studio/dots-3-note-preview:free" },
+      { id: "nvidia/nemotron-3-super-120b-a12b:free" },
+    ] },
+  { id: "pollinations", name: "Pollinations", baseUrl: "https://gen.pollinations.ai/v1", keyEnv: "POLLINATIONS_API_KEY", maxTokens: 4096,
+    models: [{ id: "openai/gpt-5.4-nano" }] },
+  { id: "ovh", name: "OVHAnon", baseUrl: "https://oai.endpoints.kepler.ai.cloud.ovh.net/v1", keyEnv: null, maxTokens: 1024,
+    models: [{ id: "gpt-oss-120b" }] },
+  { id: "groq", name: "Groq", baseUrl: "https://api.groq.com/openai/v1", keyEnv: "GROQ_API_KEY", maxTokens: 800,
+    models: [{ id: "qwen/qwen3.8-27b" }] },
+  { id: "cerebras", name: "Cerebras", baseUrl: "https://api.cerebras.ai/v1", keyEnv: "CEREBRAS_API_KEY", maxTokens: 800,
+    models: [{ id: "qwen-3.8-27b" }] },
+  { id: "go", name: "GoFallback", baseUrl: GO_BASE, keyEnv: "OPENCODE_GO_KEY", maxTokens: 4096,
+    models: [{ id: "deepseek-v4-flash" }, { id: "glm-5.3-flash" }] },
+  { id: "zenfree", name: "ZenFree", baseUrl: "https://opencode.ai/zen/v1", keyEnv: "OPENCODE_GO_KEY", maxTokens: 4096,
+    models: [
+      { id: "nemotron-3.5-lightning-free" },
+      { id: "mimo-v2.5-free" },
+      { id: "ling-3.0-flash-fin-free" },
+      { id: "nemotron-3-ultra-free" },
+    ] },
+];
 
 export interface LegResult {
   leg: string;
   model: string;
   text: string;
   cost: number;
+}
+
+/** Any leg pointed at opencode.ai must send the session contract, whatever it is called. */
+function isOpenCodeHost(l: { baseUrl?: string; id: string }): boolean {
+  return typeof l.baseUrl === "string" && l.baseUrl.includes("opencode.ai");
 }
 
 const TELE_MAX_BYTES = 5 * 1024 * 1024;
@@ -178,7 +281,13 @@ export async function completeWithFailover(
         const res = await withTimeout(
           pool.models.completeSimple(model, context, {
             transformHeaders: async (h) => {
-              if (l.id === "go" || l.id === "zenfree")
+              // Keyed on the ENDPOINT, not the leg id. It used to read
+              // `l.id === "go" || l.id === "zenfree"`, so adding a leg called `go-fast`
+              // against the same opencode.ai host silently sent NO session header and NO
+              // User-Agent -- which the Go docs require, and without which the edge 403s
+              // and the gateway 400s. It failed over to a 36s free model and looked like
+              // a quota problem. Any opencode.ai leg needs the contract; the id is a name.
+              if (isOpenCodeHost(l))
                 return { ...h, "x-opencode-session": l.session, "User-Agent": "fam-gods/1.0" };
               if (l.id === "kilo-anon")
                 // pi-ai's openai-completions impl throws "No API key" for keyless
@@ -199,7 +308,10 @@ export async function completeWithFailover(
           .map((b) => b.text)
           .join("");
         const cost = res.usage?.cost?.total ?? 0;
-        tele({ leg: l.id, model: mid, ok: true, cost, tried });
+        // Log what was SKIPPED to get here, not just the winner. A silent fall-through is
+        // how a misconfigured primary hides: the header bug above sent every request to a
+        // 36s free model and telemetry recorded only a cheerful success on that model.
+        tele({ leg: l.id, model: mid, ok: true, cost, tried, skipped: failures });
         breaker.set(l.id, 0);
         return { leg: l.id, model: mid, text, cost };
       } catch (e) {

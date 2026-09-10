@@ -1,0 +1,281 @@
+{
+  "_note": "Generated from measured hell.ts results. legs.ts reads this and falls back to BUILTIN_SPECS if missing or malformed, so deleting it cannot break the pool.",
+  "_ordering": "METERED-FIRST for speed, then the free pool by tier. DeepSeek V4.1 Flash answers in ~2s where the free pool best is 27s. TIER then LATENCY. tier1 = perfect judgement + no infra trouble. tier2 = perfect judgement but flaky. tier3 = ANSWERS BUT GETS THE JUDGEMENT WRONG -- kept last as fallback capacity, never trust one with a ranking. Price ranks nothing here: every model is cost:0. Legs whose id ends -t3 hold models that ANSWER BUT GET THE JUDGEMENT WRONG; they are placed after every correct-judgement model because the failover loop drains a leg before moving on.",
+  "_tier3warning": "Six models answer fast and confidently and called a DAG renderer IRRELEVANT to a dependency planner. Speed-first ordering would have promoted exactly those.",
+  "version": 1,
+  "generatedAt": "2026-09-10T15:35:00.203Z",
+  "battery": [
+    "live",
+    "format",
+    "json",
+    "triage",
+    "long-in",
+    "no-loop",
+    "no-refuse"
+  ],
+  "legs": [
+    {
+      "id": "go-fast",
+      "name": "GoFast",
+      "baseUrl": "https://opencode.ai/zen/go/v1",
+      "keyEnv": "OPENCODE_GO_KEY",
+      "api": "openai-completions",
+      "maxTokens": 4096,
+      "_why": "DeepSeek V4.1 Flash. Model id is deepseek-flash -- NOT deepseek-v4.1-flash, and NOT the older deepseek-v4-flash which is a different model. 4x usage promo: 6,500 -> 26,000 requests per 5 hours, limited time. Off-peak 01-04 and 06-10 UTC Mon-Fri are DOUBLE price.",
+      "_triage": "Measured 4/6 on a binary RELEVANT/IRRELEVANT verdict, biased toward rejection -- it threw away BOTH donors that were actually taken. Same model on a 1-10 SCORE separated cleanly: real donors 6,6 vs noise 2,2,1. ASK FOR A SCORE, NEVER A VERDICT.",
+      "models": [
+        {
+          "id": "deepseek-flash",
+          "tier": 1,
+          "ms": 2000,
+          "cost": {
+            "input": 0.15,
+            "output": 0.6,
+            "cacheRead": 0.003,
+            "cacheWrite": 0
+          },
+          "why": "V4.1 Flash, 4x promo window. REASONING MODEL: measured 600 reasoning_tokens on one call. Budget maxTokens for reasoning or content comes back EMPTY -- an 80-token cap produced a blank answer that looked like a failure.",
+          "reasoning": true
+        }
+      ],
+      "_identity": "DOCUMENTED, NOT INDEPENDENTLY VERIFIED. The vendor endpoint table at opencode.ai/docs/go maps \"DeepSeek V4.1 Flash\" to the id deepseek-flash, and lists deepseek-v4-flash separately as a different product with a different monthly limit. Four attempts to confirm it empirically all failed to discriminate: /models returns no version metadata, the response echoes the requested id, temperature-0 divergence was invalidated by a self-consistency control (NEITHER id is self-consistent at temp 0), and no quota headers are returned. The vendor doc is the receipt; treat it as documented."
+    },
+    {
+      "id": "go-muse",
+      "name": "GoMuse",
+      "baseUrl": "https://opencode.ai/zen/go/v1",
+      "keyEnv": "OPENCODE_GO_KEY",
+      "api": "openai-responses",
+      "maxTokens": 4096,
+      "_why": "Muse Spark 1.3 Contributor -- 45,300 req/5hr, the highest limit on the Go plan. Uses the /responses API, not /chat/completions.",
+      "_privacy": "CONTRIBUTOR TIER: discounted in exchange for permission to train future Meta models on prompts AND completions. Not ZDR. Region-limited. Do not send anything you would not publish.",
+      "models": [
+        {
+          "id": "muse-spark-1.3-contributor",
+          "tier": 4,
+          "ms": 200,
+          "cost": {
+            "input": 0.1,
+            "output": 0.2,
+            "cacheRead": 0.002,
+            "cacheWrite": 0
+          },
+          "enabled": false,
+          "why": "HTTP 403 DataPolicyError -- NOT a wiring bug. The gateway refuses this model until the workspace explicitly opts in to its data collection: https://opencode.ai/workspace/<your-wrk-id>/go . Opting in permits prompts AND completions to train future Meta models. Operator decision, not a config one."
+        }
+      ],
+      "_blocked": "403 DataPolicyError at the gateway. The /responses wiring is in place and untested because the account cannot reach the model. Free variant muse-spark-1.3-contributor-free returns HTTP 500 on zen/v1."
+    },
+    {
+      "id": "openrouter-free",
+      "name": "OpenRouterFree",
+      "baseUrl": "https://openrouter.ai/api/v1",
+      "keyEnv": "OPENROUTER_API_KEY",
+      "maxTokens": 4096,
+      "models": [
+        {
+          "id": "nex-agi/nex-n2.5-pro:free",
+          "tier": 1,
+          "ms": 26417
+        },
+        {
+          "id": "cohere/north-mini-code:free",
+          "tier": 1,
+          "ms": 29465
+        },
+        {
+          "id": "nvidia/nemotron-3.5-lightning:free",
+          "tier": 1,
+          "ms": 131476
+        },
+        {
+          "id": "google/gemma-4-31b-it:free",
+          "tier": 2,
+          "ms": 15387,
+          "why": "flaky: 4 infra errors"
+        },
+        {
+          "id": "poolside/laguna-s-2.1:free",
+          "tier": 2,
+          "ms": 20245,
+          "why": "flaky: 4 infra errors"
+        },
+        {
+          "id": "nvidia/nemotron-3-ultra-550b-a55b:free",
+          "tier": 2,
+          "ms": 53420,
+          "why": "flaky: 3 infra errors"
+        },
+        {
+          "id": "thinkingmachines/inkling:free",
+          "tier": 4,
+          "ms": 1700,
+          "enabled": false,
+          "why": "stopReason=error"
+        }
+      ]
+    },
+    {
+      "id": "zenfree",
+      "name": "ZenFree",
+      "baseUrl": "https://opencode.ai/zen/v1",
+      "keyEnv": "OPENCODE_GO_KEY",
+      "maxTokens": 4096,
+      "models": [
+        {
+          "id": "ling-3.0-flash-fin-free",
+          "tier": 1,
+          "ms": 27335
+        },
+        {
+          "id": "nemotron-3.5-lightning-free",
+          "tier": 2,
+          "ms": 334690,
+          "why": "flaky: 2 infra errors"
+        },
+        {
+          "id": "nemotron-3-ultra-free",
+          "tier": 2,
+          "ms": 513893,
+          "why": "flaky: 3 infra errors"
+        },
+        {
+          "id": "mimo-v2.5-free",
+          "tier": 4,
+          "ms": 2023,
+          "enabled": false,
+          "why": "stopReason=error"
+        }
+      ]
+    },
+    {
+      "id": "kilo-anon",
+      "name": "KiloAnon",
+      "baseUrl": "https://api.kilo.ai/api/gateway",
+      "keyEnv": null,
+      "maxTokens": 4096,
+      "models": [
+        {
+          "id": "nvidia/nemotron-3.5-lightning:free",
+          "tier": 1,
+          "ms": 179167
+        }
+      ]
+    },
+    {
+      "id": "pollinations",
+      "name": "Pollinations",
+      "baseUrl": "https://gen.pollinations.ai/v1",
+      "keyEnv": "POLLINATIONS_API_KEY",
+      "maxTokens": 4096,
+      "models": [
+        {
+          "id": "openai-large",
+          "tier": 4,
+          "ms": 1500,
+          "enabled": false,
+          "why": "stopReason=error"
+        },
+        {
+          "id": "openai/gpt-5.4-nano",
+          "tier": 4,
+          "ms": 1501,
+          "enabled": false,
+          "why": "stopReason=error"
+        }
+      ]
+    },
+    {
+      "id": "ovh",
+      "name": "OVHAnon",
+      "baseUrl": "https://oai.endpoints.kepler.ai.cloud.ovh.net/v1",
+      "keyEnv": null,
+      "maxTokens": 1024,
+      "models": [
+        {
+          "id": "gpt-oss-120b",
+          "tier": 4,
+          "ms": 1502,
+          "enabled": false,
+          "why": "stopReason=error"
+        }
+      ]
+    },
+    {
+      "id": "openrouter-free-t3",
+      "name": "OpenRouterFreeT3",
+      "baseUrl": "https://openrouter.ai/api/v1",
+      "keyEnv": "OPENROUTER_API_KEY",
+      "maxTokens": 4096,
+      "models": [
+        {
+          "id": "dots-studio/dots-3-note-preview:free",
+          "tier": 3,
+          "ms": 30353,
+          "why": "WRONG on: triage"
+        },
+        {
+          "id": "nvidia/nemotron-3-super-120b-a12b:free",
+          "tier": 3,
+          "ms": 31550,
+          "why": "WRONG on: triage"
+        }
+      ],
+      "_why": "known-wrong on triage; last-resort capacity only"
+    },
+    {
+      "id": "groq-t3",
+      "name": "GroqT3",
+      "baseUrl": "https://api.groq.com/openai/v1",
+      "keyEnv": "GROQ_API_KEY",
+      "maxTokens": 800,
+      "models": [
+        {
+          "id": "qwen/qwen3.8-27b",
+          "tier": 3,
+          "ms": 11674,
+          "why": "WRONG on: triage"
+        }
+      ],
+      "_why": "known-wrong on triage; last-resort capacity only"
+    },
+    {
+      "id": "cerebras-t3",
+      "name": "CerebrasT3",
+      "baseUrl": "https://api.cerebras.ai/v1",
+      "keyEnv": "CEREBRAS_API_KEY",
+      "maxTokens": 800,
+      "models": [
+        {
+          "id": "qwen-3.8-27b",
+          "tier": 3,
+          "ms": 12548,
+          "why": "WRONG on: triage"
+        }
+      ],
+      "_why": "known-wrong on triage; last-resort capacity only"
+    },
+    {
+      "id": "go-t3",
+      "name": "GoFallbackT3",
+      "baseUrl": "https://opencode.ai/zen/go/v1",
+      "keyEnv": "OPENCODE_GO_KEY",
+      "maxTokens": 4096,
+      "models": [
+        {
+          "id": "glm-5.3-flash",
+          "tier": 3,
+          "ms": 19352,
+          "why": "WRONG on: triage"
+        },
+        {
+          "id": "deepseek-v4-flash",
+          "tier": 3,
+          "ms": 30151,
+          "why": "WRONG on: triage"
+        }
+      ],
+      "_why": "known-wrong on triage; last-resort capacity only"
+    }
+  ]
+}
