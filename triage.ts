@@ -1,22 +1,33 @@
-// triage.ts — score a loot ledger across three INDEPENDENT quota lanes at once.
+// triage.ts — score a loot ledger across independent quota lanes.
 //
-// The job: 8,137 unseen rows in apex-memory's loot ledger, harvested and labelled by
-// omnithief and never read by anything. Deterministic labels got them into the vault;
-// only a model can put them in a useful order.
+// The job: 4,982 triageable rows in apex-memory's loot ledger -- unseen, and carrying a
+// summary a model can actually judge -- harvested and labelled by omnithief and never
+// read by anything. Deterministic labels got them into the vault; only a model can put
+// them in a useful order. (The ledger holds ~12,000 rows total; the rest are already
+// judged or have no usable summary. "8,137" was quoted for a while and was wrong.)
 //
-// WHY THREE LANES. They are three different ACCOUNTS, so their rate limits are
-// independent and the wall clock is the slowest lane's share, not the sum:
+// TWO LANES, two different ACCOUNTS, so their rate limits are independent:
 //
-//   kilo   kilo GATEWAY, anonymous     cohere/north-mini-code:free   0.37s/candidate  $0
-//   cline  cline's own free tier     muse-spark-1.3-contributor    1.13s/candidate  $0
-//   go     the operator's $10 sub    deepseek-flash (V4.1, 4x)     1.22s/candidate  ~$1.18 total
+//   cline  cline's own free tier    muse-spark-1.3-contributor   1.13s/candidate  $0
+//   go     the operator's $10 sub   deepseek-flash (V4.1, 4x)    1.22s/candidate  ~$1.18
 //
-// Measured 2026-09-10, batches of 40 (20 for go). kilo alone: 160/200 scored in 2.6 min.
+// KILO WAS DROPPED. Its gateway worked beautifully in isolation -- 40/40 in 14.7s,
+// anonymous, cost 0 -- and then degraded to 3 batches out of 8 on a real run, which is
+// the documented 200 req/hr/IP anonymous cap arriving. An unreliable lane is worse than
+// no lane: it silently drops candidates, and this run lost 200 rows that way. A
+// KILO_API_KEY from app.kilo.ai would lift the cap and make it viable again.
 //
-// 5. THE AGENT CLI IS THE SLOW PART, NOT THE MODEL. kilo run spent a batch reading this
-//    repo and returned zero scores; its GATEWAY, same model, scored 40/40 in 14.7s with
-//    no key. Where a vendor publishes an OpenAI-compatible endpoint, use it -- an agent
-//    wrapper adds tools, a working directory, and non-determinism you did not ask for.
+// TWO MODES, and the difference is the whole point:
+//
+//   throughput (default)  lanes take DISJOINT batches. Fast. Every score is one model's
+//                         unverified opinion.
+//   --consensus           every candidate goes to EVERY lane. Twice the calls, and the
+//                         only mode that produces CORROBORATION. Measured: a blended
+//                         throughput run put `sort-asc` and `sort-object` -- trivial
+//                         string sorters -- at 10/10 for a dependency planner, on a
+//                         keyword match. Two independent models agreeing does not do
+//                         that. The verdict folds on the FLOOR, never the mean, because
+//                         a candidate is only as good as the least impressed model.
 //
 // FOUR THINGS THAT WILL BITE WHOEVER TOUCHES THIS NEXT, all measured:
 //
@@ -34,7 +45,8 @@
 //    through cline, because it is cline's account and cline's opt-in.
 //
 // Usage:
-//   node triage.ts --hunt "<hunt>" [--limit 400] [--batch 40] [--lanes kilo,cline,go]
+//   node triage.ts --hunt "<hunt>" [--limit 400] [--batch 40] [--lanes cline,go]
+//   node triage.ts --hunt "<hunt>" --consensus     every lane scores every candidate
 //   node triage.ts --hunt "<hunt>" --dry            plan only, no calls
 import { spawn } from "node:child_process";
 import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -52,10 +64,12 @@ function arg(name: string, dflt: string): string {
   return i === -1 || process.argv[i + 1] === undefined ? dflt : process.argv[i + 1];
 }
 const DRY = process.argv.includes("--dry");
+/** Send every candidate to EVERY lane, so agreement between them is measurable. */
+const CONSENSUS = process.argv.includes("--consensus");
 const HUNT = arg("hunt", "");
 const LIMIT = Number(arg("limit", "400"));
 const BATCH = Number(arg("batch", "40"));
-const LANES = arg("lanes", "kilo,cline,go").split(",").map((s) => s.trim());
+const LANES = arg("lanes", "cline,go").split(",").map((s) => s.trim());
 
 interface Lane {
   id: string;
@@ -78,50 +92,6 @@ const LANE_SPECS: Record<string, Lane> = {
     parse: harvestText,
   },
 };
-
-/**
- * The KILO lane, via the GATEWAY -- not the `kilo` CLI.
- *
- * `kilo run` is an autonomous coding agent. Pointed at a scoring prompt it spent a whole
- * batch reading legs.ts and cli-legs.ts and returned zero scores, and it was
- * non-deterministic about it: one clean answer by hand, none through this runner, and an
- * empty cwd stopped it touching the repo without making it answer. The model was never
- * the problem -- north-mini-code:free is Tier 1 on the hell battery -- the AGENT WRAPPER
- * was, and a non-deterministic wrapper is not something you schedule 8,137 rows against.
- *
- * Kilo publishes an OpenAI-compatible gateway at the SAME base URL legs.ts already uses
- * for its anonymous leg, so the wrapper is entirely optional:
- *   https://kilo.ai/docs/gateway -- "unified, OpenAI-compatible API ... /chat/completions"
- * Measured anonymous, no key: 40/40 scored in 14.7s, cost 0, is_byok false.
- *
- * Anonymous is capped (200 req/hr/IP per legs.ts) = 8,000 candidates/hr at 40 a call,
- * which covers the backlog. A KILO_API_KEY from app.kilo.ai lifts the cap if it ever
- * binds; the call shape does not change, so it is picked up automatically when present.
- */
-async function kiloBatch(prompt: string): Promise<string> {
-  const key = process.env.KILO_API_KEY;
-  const headers: Record<string, string> = {
-    "Content-Type": "application/json",
-    "User-Agent": "fam-gods/1.0",
-  };
-  if (key) headers.Authorization = `Bearer ${key}`;
-  else headers["cf-aig-authorization"] = "anonymous";
-
-  const r = await fetch("https://api.kilo.ai/api/gateway/chat/completions", {
-    method: "POST",
-    headers,
-    // Generous: measured 1,772 of its output tokens spent reasoning before it answered.
-    body: JSON.stringify({
-      model: "cohere/north-mini-code:free",
-      messages: [{ role: "user", content: prompt }],
-      max_tokens: 4000,
-    }),
-    signal: AbortSignal.timeout(180_000),
-  });
-  const j = (await r.json()) as { choices?: { message?: { content?: string } }[]; error?: unknown };
-  if (j.error) throw new Error(JSON.stringify(j.error).slice(0, 160));
-  return j.choices?.[0]?.message?.content ?? "";
-}
 
 /** The Go lane is HTTP, not a subprocess -- no startup tax, so it uses a smaller batch. */
 async function goBatch(prompt: string): Promise<string> {
@@ -278,23 +248,36 @@ async function main(): Promise<void> {
     return;
   }
 
-  // Deal batches round-robin so every lane starts immediately and a slow lane cannot
-  // hold the whole run: the wall clock becomes the slowest LANE, never the sum.
-  const HTTP_LANES = new Set(["go", "kilo"]);
+  const HTTP_LANES = new Set(["go"]);
   const lanes = LANES.filter((l) => HTTP_LANES.has(l) || LANE_SPECS[l] !== undefined);
   const work: Record<string, { donor: string; summary: string }[][]> = {};
   for (const l of lanes) work[l] = [];
   // go uses a smaller batch: it is the metered lane and the one that reasons hardest.
   const size = (l: string) => (l === "go" ? Math.min(BATCH, 20) : BATCH);
 
-  let i = 0;
-  let turn = 0;
-  while (i < all.length) {
-    const lane = lanes[turn % lanes.length];
-    const n = size(lane);
-    work[lane].push(all.slice(i, i + n));
-    i += n;
-    turn += 1;
+  if (CONSENSUS) {
+    // CONSENSUS: every candidate goes to EVERY lane. Twice the calls, but it is the only
+    // mode that produces corroboration -- and corroboration is the thing the whole
+    // discovery stack has been trying to manufacture. Two independent models both
+    // scoring a candidate high is a far stronger signal than one model's 10, which the
+    // first run showed can be a keyword match on "sort".
+    for (const lane of lanes) {
+      for (let j = 0; j < all.length; j += size(lane)) work[lane].push(all.slice(j, j + size(lane)));
+    }
+  } else {
+    // THROUGHPUT (default): deal batches round-robin so every lane starts immediately and
+    // a slow lane cannot hold the run -- wall clock is the slowest LANE, never the sum.
+    // NOTE: in this mode the lanes score DISJOINT candidates, so there is no agreement to
+    // measure. Scores are one model's opinion. Use --consensus when that matters.
+    let i = 0;
+    let turn = 0;
+    while (i < all.length) {
+      const lane = lanes[turn % lanes.length];
+      const n = size(lane);
+      work[lane].push(all.slice(i, i + n));
+      i += n;
+      turn += 1;
+    }
   }
 
   process.stdout.write(
@@ -308,7 +291,12 @@ async function main(): Promise<void> {
   }
 
   const t0 = Date.now();
-  const scored = new Map<string, number>();
+  // EVERY observation is kept, stamped with the lane that produced it. The old
+  // Map<donor, score> let the last writer win, which silently threw away exactly the
+  // disagreement worth knowing about -- and made "555 scored" a count of survivors
+  // rather than of work done.
+  const obs: { donor: string; lane: string; score: number }[] = [];
+
   const laneRuns = lanes.map(async (lane) => {
     let ok = 0;
     let fail = 0;
@@ -317,7 +305,6 @@ async function main(): Promise<void> {
       try {
         let txt: string;
         if (lane === "go") txt = await goBatch(prompt);
-        else if (lane === "kilo") txt = await kiloBatch(prompt);
         else {
           const spec = LANE_SPECS[lane];
           const f = join(SCRATCH, `${lane}-${Date.now()}.txt`);
@@ -327,10 +314,10 @@ async function main(): Promise<void> {
         const scores = parseScores(txt, batch.length);
         for (const [n, s] of scores) {
           const row = batch[n - 1];
-          if (row) scored.set(row.donor, s);
+          if (row) obs.push({ donor: row.donor, lane, score: s });
         }
         scores.size > 0 ? (ok += 1) : (fail += 1);
-        process.stdout.write(`  ${lane.padEnd(6)} batch ok=${ok} empty=${fail}  scored=${scored.size}\n`);
+        process.stdout.write(`  ${lane.padEnd(6)} batch ok=${ok} empty=${fail}  observations=${obs.length}\n`);
       } catch (e) {
         fail += 1;
         process.stdout.write(`  ${lane.padEnd(6)} FAILED: ${String((e as Error).message).slice(0, 90)}\n`);
@@ -342,17 +329,50 @@ async function main(): Promise<void> {
   const results = await Promise.all(laneRuns);
   const ms = Date.now() - t0;
   const out = join(OUT_DIR, "triage.jsonl");
-  for (const [donor, score] of scored) {
-    appendFileSync(out, `${JSON.stringify({ ts: Date.now(), hunt: HUNT, donor, score })}\n`);
+  const stamp = Date.now();
+  for (const o of obs) {
+    appendFileSync(out, `${JSON.stringify({ ts: stamp, hunt: HUNT, donor: o.donor, lane: o.lane, score: o.score })}\n`);
   }
 
-  const ranked = [...scored.entries()].sort((a, b) => b[1] - a[1]);
+  // Fold observations into a verdict per donor.
+  const byDonor = new Map<string, { lane: string; score: number }[]>();
+  for (const o of obs) byDonor.set(o.donor, [...(byDonor.get(o.donor) ?? []), o]);
+
+  const folded = [...byDonor.entries()].map(([donor, v]) => {
+    const scores = v.map((x) => x.score);
+    const min = Math.min(...scores);
+    const max = Math.max(...scores);
+    return {
+      donor,
+      lanes: v.length,
+      min,
+      max,
+      spread: max - min,
+      // The floor, not the mean. A candidate is only as good as the LEAST impressed
+      // model that looked at it: averaging lets one keyword match drag noise to the top,
+      // which is how sort-asc and sort-object reached 10/10 for a dependency planner.
+      floor: min,
+    };
+  });
+
+  const agreed = folded.filter((f) => f.lanes > 1 && f.floor >= 8).sort((a, b) => b.floor - a.floor || a.spread - b.spread);
+  const single = folded.filter((f) => f.lanes === 1).sort((a, b) => b.max - a.max);
+  const contested = folded.filter((f) => f.lanes > 1 && f.spread >= 5).sort((a, b) => b.spread - a.spread);
+
+  const line = (f: { donor: string; min: number; max: number; lanes: number }) =>
+    `  ${String(f.min).padStart(2)}-${String(f.max).padEnd(2)}  ${String(f.lanes)} lane${f.lanes > 1 ? "s" : " "}  ${f.donor}`;
+
   process.stdout.write(
-    `\nDONE  ${scored.size}/${all.length} scored in ${(ms / 1000 / 60).toFixed(1)} min\n` +
+    `\nDONE  ${obs.length} observations over ${byDonor.size} donors of ${all.length} rows, ${(ms / 1000 / 60).toFixed(1)} min\n` +
       results.map((r) => `  ${r.lane.padEnd(6)} ok=${r.ok} failed=${r.fail}`).join("\n") +
-      `\n\nTOP 15 — the reading order:\n` +
-      ranked.slice(0, 15).map(([d, s]) => `  ${String(s).padStart(2)}/10  ${d}`).join("\n") +
-      `\n\nwritten: ${out}\n`,
+      (CONSENSUS
+        ? `\n\nAGREED — every lane scored it 8+ (${agreed.length}). This is the shortlist:\n` +
+          (agreed.length === 0 ? "  none\n" : `${agreed.slice(0, 15).map(line).join("\n")}\n`) +
+          `\nCONTESTED — lanes disagree by 5+ (${contested.length}). Read these yourself:\n` +
+          (contested.length === 0 ? "  none\n" : `${contested.slice(0, 8).map(line).join("\n")}\n`)
+        : `\n\nTOP 15 — ONE lane's opinion each, no corroboration (use --consensus for that):\n` +
+          `${single.slice(0, 15).map(line).join("\n")}\n`) +
+      `\nwritten: ${out}\n`,
   );
 }
 
