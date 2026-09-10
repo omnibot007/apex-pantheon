@@ -62,7 +62,7 @@ def main():
                 data=_json.dumps({"text": text, "voice": voice, "play": True}).encode(),
                 headers={"Content-Type": "application/json"},
             )
-            res = _json.load(_url.urlopen(req, timeout=600))
+            res = _json.load(_url.urlopen(req, timeout=30))
             if res.get("ok"):
                 return 0
         except Exception as e:
