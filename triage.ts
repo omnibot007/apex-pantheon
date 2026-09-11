@@ -60,6 +60,7 @@ import { spawn } from "node:child_process";
 import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 
 const LOOT = join(homedir(), ".apex-memory", "loot.jsonl");
 const OUT_DIR = join(homedir(), ".commandcode", "fam-gods");
@@ -79,7 +80,14 @@ const CONSENSUS = process.argv.includes("--consensus");
 const HUNT = arg("hunt", "");
 const LIMIT = Number(arg("limit", "400"));
 const BATCH = Number(arg("batch", "40"));
-const LANES = arg("lanes", "cline,go").split(",").map((s) => s.trim());
+// DEFAULT IS go,zen -- two tier-1 models, one credential, both HTTP.
+// `cline` was the default and is no longer: cline 3.0.61 is an autonomous coding agent,
+// and handed a scoring prompt it answered by running `dir`, burning 8,382 input tokens
+// of its own system prompt on iteration 1 and returning no scores. Not auth, not quota
+// (totalCost 0) -- the same defect that retired `kilo run`, and triage.ts ALREADY runs it
+// in an empty cwd, so the sandbox mitigation is not enough. Pass --lanes cline,go to try
+// it anyway.
+const LANES = arg("lanes", "go,zen").split(",").map((s) => s.trim());
 
 interface LootRow {
   donor: string;
@@ -167,13 +175,39 @@ const LANE_SPECS: Record<string, Lane> = {
   },
 };
 
-/** The Go lane is HTTP, not a subprocess -- no startup tax, so it uses a smaller batch. */
-async function goBatch(prompt: string): Promise<string> {
+/**
+ * HTTP lanes -- no subprocess, so no startup tax, so a smaller batch costs nothing.
+ *
+ * TWO KINDS OF INDEPENDENCE, and this file used to conflate them. Separate ACCOUNTS buy
+ * throughput: their rate limits do not stack. Separate MODELS buy corroboration: two
+ * judgements that can actually disagree. Tying the two together is why losing one CLI
+ * account took the agreement signal with it, while a tier-1 second opinion sat unused on
+ * a credential already loaded. `zen` is that second opinion: a DIFFERENT model reached
+ * with the SAME key, which buys agreement without buying throughput. Worth knowing which
+ * one you are short of.
+ *
+ * ONLY TIER-1 MODELS BELONG HERE. glm-5.3-flash and deepseek-v4-flash ride this very key
+ * and are both tier 3 -- "WRONG on: triage" in legs.config.json. They answer fast and
+ * confidently and called a DAG renderer irrelevant to a dependency planner. A wrong
+ * second opinion is worse than none: it manufactures agreement.
+ */
+const HTTP_LANE_SPECS: Record<string, { url: string; model: string; batch: number }> = {
+  go: { url: "https://opencode.ai/zen/go/v1/chat/completions", model: "deepseek-flash", batch: 20 },
+  zen: { url: "https://opencode.ai/zen/v1/chat/completions", model: "ling-3.0-flash-fin-free", batch: 20 },
+};
+
+async function httpBatch(lane: string, prompt: string): Promise<string> {
+  const spec = HTTP_LANE_SPECS[lane];
+  if (spec === undefined) throw new Error(`no HTTP spec for lane '${lane}'`);
+  // NOT vestigial, and the discarded return value makes it look it: buildPool() is what
+  // reads ~/.config/opencode/.go-key into process.env via fileKeyEnv (legs.ts:133).
+  // Drop this line and both HTTP lanes work only for a shell that already exported the
+  // variable by hand -- green on the developer's machine, dead on a fresh one.
   const { buildPool } = await import("./legs.ts");
   buildPool("triage");
   const key = process.env.OPENCODE_GO_KEY;
-  if (!key) throw new Error("OPENCODE_GO_KEY not loaded");
-  const r = await fetch("https://opencode.ai/zen/go/v1/chat/completions", {
+  if (!key) throw new Error("OPENCODE_GO_KEY not loaded (no env var and no ~/.config/opencode/.go-key)");
+  const r = await fetch(spec.url, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${key}`,
@@ -181,8 +215,10 @@ async function goBatch(prompt: string): Promise<string> {
       "User-Agent": "fam-gods/1.0",
       "x-opencode-session": `triage-${Date.now()}`,
     },
-    // 8000, not 3000: this model spends thousands of tokens reasoning before it answers.
-    body: JSON.stringify({ model: "deepseek-flash", messages: [{ role: "user", content: prompt }], max_tokens: 8000 }),
+    // 8000, not 3000: these models spend thousands of tokens reasoning before answering,
+    // and a tight cap returns EMPTY, which reads exactly like a crashed request. Measured
+    // on ling: 333 of 369 completion tokens were reasoning_tokens on a 5-candidate probe.
+    body: JSON.stringify({ model: spec.model, messages: [{ role: "user", content: prompt }], max_tokens: 8000 }),
     signal: AbortSignal.timeout(240_000),
   });
   const j = (await r.json()) as { choices?: { message?: { content?: string } }[]; error?: unknown };
@@ -234,16 +270,43 @@ function buildPrompt(hunt: string, rows: { donor: string; summary: string }[]): 
  * pieces of noise at the top. Anything outside 1-10, or pointing past the batch, is not a
  * score and is dropped.
  */
-function parseScores(txt: string, batchSize: number): Map<number, number> {
-  const out = new Map<number, number>();
-  for (const line of txt.split("\n")) {
-    const m = /^\s*(\d{1,3})\s*:\s*(\d{1,2})\s*$/.exec(line.trim());
+const SCORE_SHAPES: readonly RegExp[] = [
+  // 7:9 -- exactly what the prompt asks for.
+  /^(\d{1,3})\s*:\s*(\d{1,2})$/,
+  // 7. owner/repo: 9 -- what a model that heard "one line per candidate" as "numbered
+  // list" actually emits. MEASURED, not hypothetical: ling-3.0-flash-fin-free returns
+  // this shape and scored a 5-candidate probe perfectly (three real engines 10/10/10,
+  // two planted decoys 1/1) while the single strict shape matched NONE of its lines.
+  // A lane reads "ok=0 empty=1" for that, which is indistinguishable from a dead lane.
+  // Still anchored at BOTH ends: the trailing `: <1-2 digits>$` is what keeps it off the
+  // echoed prompt, whose lines end in prose.
+  /^(\d{1,3})[.)]\s*\S.*?:\s*(\d{1,2})$/,
+];
+
+/** One line in, one validated score out, or null. The only place a score is recognised. */
+export function readScoreLine(line: string, batchSize: number): { idx: number; score: number } | null {
+  const t = line.trim();
+  for (const re of SCORE_SHAPES) {
+    const m = re.exec(t);
     if (m === null) continue;
     const idx = Number(m[1]);
     const score = Number(m[2]);
+    // Range and index checks are the whole defence. Without them a loose pattern matched
+    // the echoed prompt's numbered list and produced 40/10 and 34/10 on a 1-10 scale,
+    // ranking two pieces of noise above everything real. Widening the SHAPE is safe only
+    // because these two checks never widened.
     if (idx < 1 || idx > batchSize) continue;
     if (score < 1 || score > 10) continue;
-    out.set(idx, score);
+    return { idx, score };
+  }
+  return null;
+}
+
+export function parseScores(txt: string, batchSize: number): Map<number, number> {
+  const out = new Map<number, number>();
+  for (const line of txt.split("\n")) {
+    const hit = readScoreLine(line, batchSize);
+    if (hit !== null) out.set(hit.idx, hit.score);
   }
   return out;
 }
@@ -259,9 +322,15 @@ function parseScores(txt: string, batchSize: number): Map<number, number> {
  * keep the one with the MOST line-anchored N:score lines -- never the longest, because
  * the echoed prompt is longer than the answer and full of numbered lines.
  */
-/** How many lines look like a real 1-10 score line. */
+/**
+ * How many lines look like a real 1-10 score line. Shares readScoreLine with the parser,
+ * so a shape the parser accepts can never be a shape the harvester overlooks -- pick the
+ * wrong string here and a perfectly good answer is discarded before parsing.
+ * The bound is permissive because this only RANKS candidate strings; the batch-accurate
+ * index check happens in parseScores.
+ */
 const scoreLines = (s: string): number =>
-  s.split("\n").filter((l) => /^\s*\d{1,3}\s*:\s*(?:10|[1-9])\s*$/.test(l.trim())).length;
+  s.split("\n").filter((l) => readScoreLine(l, 999) !== null).length;
 
 function harvestText(raw: string): string {
   let best = "";
@@ -326,12 +395,19 @@ async function main(): Promise<void> {
     return;
   }
 
-  const HTTP_LANES = new Set(["go"]);
-  const lanes = LANES.filter((l) => HTTP_LANES.has(l) || LANE_SPECS[l] !== undefined);
+  const isHttp = (l: string): boolean => HTTP_LANE_SPECS[l] !== undefined;
+  const lanes = LANES.filter((l) => isHttp(l) || LANE_SPECS[l] !== undefined);
+  if (lanes.length === 0) {
+    process.stdout.write(`triage: no usable lanes in "${LANES.join(",")}"\n`);
+    return;
+  }
   const work: Record<string, { donor: string; summary: string }[][]> = {};
   for (const l of lanes) work[l] = [];
-  // go uses a smaller batch: it is the metered lane and the one that reasons hardest.
-  const size = (l: string) => (l === "go" ? Math.min(BATCH, 20) : BATCH);
+  // HTTP lanes take a smaller batch: they are the ones that reason hardest, and a big
+  // batch against a reasoning model is how you get an empty response that reads like a
+  // crash. CLI lanes take the big batch because their ~33s startup is fixed per call and
+  // only amortises across a large one.
+  const size = (l: string) => (isHttp(l) ? Math.min(BATCH, HTTP_LANE_SPECS[l].batch) : BATCH);
 
   if (CONSENSUS) {
     // CONSENSUS: every candidate goes to EVERY lane. Twice the calls, but it is the only
@@ -389,7 +465,7 @@ async function main(): Promise<void> {
       const prompt = buildPrompt(HUNT, batch);
       try {
         let txt: string;
-        if (lane === "go") txt = await goBatch(prompt);
+        if (isHttp(lane)) txt = await httpBatch(lane, prompt);
         else {
           const spec = LANE_SPECS[lane];
           const f = join(SCRATCH, `${lane}-${Date.now()}.txt`);
@@ -447,20 +523,40 @@ async function main(): Promise<void> {
   const line = (f: { donor: string; min: number; max: number; lanes: number }) =>
     `  ${String(f.min).padStart(2)}-${String(f.max).padEnd(2)}  ${String(f.lanes)} lane${f.lanes > 1 ? "s" : " "}  ${f.donor}`;
 
+  // A --consensus run that loses a lane silently becomes a throughput run. Every donor
+  // lands lanes:1, the AGREED filter (lanes>1) matches nothing, and the report prints
+  // "none" -- which reads as "both models looked and shortlisted nothing" when the truth
+  // is "only one model ever spoke". MEASURED: cline returned no scores mid-run and the
+  // summary announced AGREED none / CONTESTED none over 40 perfectly good scores. The
+  // lane tally four lines above said ok=0 and the summary still misled. Name it instead.
+  const answering = new Set(obs.map((o) => o.lane));
+  const degraded = CONSENSUS && answering.size < 2;
+
   process.stdout.write(
     `\nDONE  ${obs.length} observations over ${byDonor.size} donors of ${all.length} rows, ${(ms / 1000 / 60).toFixed(1)} min\n` +
       results.map((r) => `  ${r.lane.padEnd(6)} ok=${r.ok} failed=${r.fail}`).join("\n") +
-      (CONSENSUS
-        ? `\n\nAGREED — every lane scored it 8+ (${agreed.length}). This is the shortlist:\n` +
-          (agreed.length === 0 ? "  none\n" : `${agreed.slice(0, 15).map(line).join("\n")}\n`) +
-          `\nCONTESTED — lanes disagree by 5+ (${contested.length}). Read these yourself:\n` +
-          (contested.length === 0 ? "  none\n" : `${contested.slice(0, 8).map(line).join("\n")}\n`)
-        : `\n\nTOP 15 — ONE lane's opinion each, no corroboration (use --consensus for that):\n` +
-          `${single.slice(0, 15).map(line).join("\n")}\n`) +
+      (degraded
+        ? `\n\n!!  NO CORROBORATION — --consensus asked ${lanes.length} lanes, ${answering.size} answered` +
+          ` (${answering.size === 0 ? "none" : [...answering].join(", ")}).\n` +
+          `    Every score below is ONE model's unverified opinion. AGREED is empty because\n` +
+          `    nothing had a second lane to agree WITH, not because nothing scored well.\n` +
+          `    Re-run with a second tier-1 lane before trusting any ranking from this.\n` +
+          `\nTOP 15 — single lane, uncorroborated:\n${single.slice(0, 15).map(line).join("\n")}\n`
+        : CONSENSUS
+          ? `\n\nAGREED — every lane scored it 8+ (${agreed.length}). This is the shortlist:\n` +
+            (agreed.length === 0 ? "  none\n" : `${agreed.slice(0, 15).map(line).join("\n")}\n`) +
+            `\nCONTESTED — lanes disagree by 5+ (${contested.length}). Read these yourself:\n` +
+            (contested.length === 0 ? "  none\n" : `${contested.slice(0, 8).map(line).join("\n")}\n`)
+          : `\n\nTOP 15 — ONE lane's opinion each, no corroboration (use --consensus for that):\n` +
+            `${single.slice(0, 15).map(line).join("\n")}\n`) +
       `\nwritten: ${out}\n`,
   );
 }
 
-main().catch((e: unknown) => {
-  process.stdout.write(`triage: ${String((e as Error).message).slice(0, 200)}\n`);
-});
+// Only run when invoked directly. triage-smoke.ts imports the parser from here, and an
+// unguarded main() would fire a triage run just for importing a pure function.
+if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
+  main().catch((e: unknown) => {
+    process.stdout.write(`triage: ${String((e as Error).message).slice(0, 200)}\n`);
+  });
+}
