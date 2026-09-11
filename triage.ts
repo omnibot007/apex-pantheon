@@ -1,10 +1,17 @@
 // triage.ts — score a loot ledger across independent quota lanes.
 //
-// The job: 4,982 triageable rows in apex-memory's loot ledger -- unseen, and carrying a
+// The job: the triageable rows in apex-memory's loot ledger -- unseen, and carrying a
 // summary a model can actually judge -- harvested and labelled by omnithief and never
 // read by anything. Deterministic labels got them into the vault; only a model can put
-// them in a useful order. (The ledger holds ~12,000 rows total; the rest are already
-// judged or have no usable summary. "8,137" was quoted for a while and was wrong.)
+// them in a useful order.
+//
+// DO NOT WRITE THE BACKLOG SIZE HERE. Run `node triage.ts --backlog`. It counts with
+// isTriageable(), the same predicate main() loads with, and prints the rule beside the
+// number so the two can never travel apart. This line used to read "4,982" while the
+// rule itself sat 240 lines below it; a later reader counted "unseen with ANY summary"
+// instead, got 11,642, and went looking for a data problem that was only ever a
+// mis-stated filter. Before that, "8,137" -- the entire ledger, judged rows and all --
+// was quoted for a while. Three different numbers, one missing predicate.
 //
 // TWO LANES, two different ACCOUNTS, so their rate limits are independent:
 //
@@ -45,6 +52,7 @@
 //    through cline, because it is cline's account and cline's opt-in.
 //
 // Usage:
+//   node triage.ts --backlog                        what is left, per hunt, with the rule
 //   node triage.ts --hunt "<hunt>" [--limit 400] [--batch 40] [--lanes cline,go]
 //   node triage.ts --hunt "<hunt>" --consensus     every lane scores every candidate
 //   node triage.ts --hunt "<hunt>" --dry            plan only, no calls
@@ -64,12 +72,78 @@ function arg(name: string, dflt: string): string {
   return i === -1 || process.argv[i + 1] === undefined ? dflt : process.argv[i + 1];
 }
 const DRY = process.argv.includes("--dry");
+/** Report what is left to triage, with the rule that defines it, and call nothing. */
+const BACKLOG = process.argv.includes("--backlog");
 /** Send every candidate to EVERY lane, so agreement between them is measurable. */
 const CONSENSUS = process.argv.includes("--consensus");
 const HUNT = arg("hunt", "");
 const LIMIT = Number(arg("limit", "400"));
 const BATCH = Number(arg("batch", "40"));
 const LANES = arg("lanes", "cline,go").split(",").map((s) => s.trim());
+
+interface LootRow {
+  donor: string;
+  hunt: string;
+  summary: string;
+  verdict: string;
+}
+
+/**
+ * THE ONE DEFINITION OF "TRIAGEABLE". main() loads with it and --backlog counts with it,
+ * so the reported number cannot drift from the work actually queued.
+ *
+ * Why a constant beside the predicate: a count is not a fact unless its filter travels
+ * with it. Every wrong backlog figure this project has produced came from separating the
+ * two -- see the header. `--backlog` prints RULE next to the number for that reason.
+ *
+ * The `> 25` bar is not arbitrary: omnithief writes short deterministic stubs ("pending",
+ * a bare topic word) for rows it could not summarise, and a model handed one of those is
+ * scoring a label, not a candidate. 25 characters is where a real one-line description
+ * starts.
+ */
+const TRIAGEABLE_RULE = 'verdict === "unseen" && summary.length > 25';
+function isTriageable(r: LootRow): boolean {
+  return r.verdict === "unseen" && String(r.summary ?? "").length > 25;
+}
+
+function readLoot(): LootRow[] {
+  return readFileSync(LOOT, "utf-8")
+    .split("\n")
+    .filter(Boolean)
+    .map((l) => JSON.parse(l) as LootRow);
+}
+
+/** Count what is left, per hunt, and show the rule that decided it. Calls nothing. */
+function reportBacklog(): void {
+  const rows = readLoot();
+  const byHunt = new Map<string, number>();
+  let triageable = 0;
+  let judged = 0;
+  let thin = 0;
+  for (const r of rows) {
+    if (r.verdict !== "unseen") {
+      judged += 1;
+      continue;
+    }
+    if (!isTriageable(r)) {
+      thin += 1;
+      continue;
+    }
+    triageable += 1;
+    byHunt.set(r.hunt, (byHunt.get(r.hunt) ?? 0) + 1);
+  }
+  const ranked = [...byHunt.entries()].sort((a, b) => b[1] - a[1]);
+  process.stdout.write(
+    `BACKLOG  ${LOOT}\n` +
+      `  RULE  ${TRIAGEABLE_RULE}\n\n` +
+      `  ${String(rows.length).padStart(6)}  rows in ledger\n` +
+      `  ${String(judged).padStart(6)}  already judged (verdict is not "unseen")\n` +
+      `  ${String(thin).padStart(6)}  unseen but summary too thin to judge\n` +
+      `  ${String(triageable).padStart(6)}  TRIAGEABLE\n\n` +
+      ranked.map(([h, n]) => `  ${String(n).padStart(6)}  ${h}`).join("\n") +
+      `\n\n  node triage.ts --hunt "<hunt>" --consensus\n`,
+  );
+}
 
 interface Lane {
   id: string;
@@ -228,23 +302,27 @@ function harvestText(raw: string): string {
 }
 
 async function main(): Promise<void> {
+  // Before the --hunt guard: asking what is left must never require knowing a hunt name.
+  if (BACKLOG) {
+    reportBacklog();
+    return;
+  }
   if (HUNT === "") {
-    process.stdout.write('triage: --hunt "<the hunt>" is required\n');
+    process.stdout.write('triage: --hunt "<the hunt>" is required (or --backlog)\n');
     return;
   }
   mkdirSync(SCRATCH, { recursive: true });
   mkdirSync(SANDBOX, { recursive: true });
   mkdirSync(OUT_DIR, { recursive: true });
 
-  const all = readFileSync(LOOT, "utf-8")
-    .split("\n")
-    .filter(Boolean)
-    .map((l) => JSON.parse(l) as { donor: string; hunt: string; summary: string; verdict: string })
-    .filter((r) => r.hunt === HUNT && r.verdict === "unseen" && String(r.summary ?? "").length > 25)
-    .slice(0, LIMIT);
+  const matching = readLoot().filter((r) => r.hunt === HUNT && isTriageable(r));
+  const all = matching.slice(0, LIMIT);
 
   if (all.length === 0) {
-    process.stdout.write(`triage: no unseen rows with a usable summary for that hunt\n`);
+    process.stdout.write(
+      `triage: no rows for that hunt under ${TRIAGEABLE_RULE}\n` +
+        `  run --backlog for the hunts that do have work\n`,
+    );
     return;
   }
 
@@ -280,8 +358,15 @@ async function main(): Promise<void> {
     }
   }
 
+  // Say what is being LEFT, not just what is being taken. A run that silently stops at
+  // --limit reads exactly like a run that finished the hunt; the same trap the memory
+  // store hit when a default page size passed for the whole answer.
+  const remaining = matching.length - all.length;
   process.stdout.write(
-    `TRIAGE  hunt="${HUNT.slice(0, 46)}"\n  rows ${all.length}  lanes ${lanes.join(", ")}\n` +
+    `TRIAGE  hunt="${HUNT.slice(0, 46)}"\n` +
+      `  rows ${all.length} of ${matching.length} triageable` +
+      (remaining > 0 ? `  (--limit leaves ${remaining} for a later run)` : `  (the whole hunt)`) +
+      `\n  lanes ${lanes.join(", ")}\n` +
       lanes.map((l) => `    ${l.padEnd(6)} ${work[l].length} batches of ${size(l)}`).join("\n") +
       "\n\n",
   );
